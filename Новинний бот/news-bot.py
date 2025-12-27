@@ -3,17 +3,40 @@ import feedparser
 import sqlite3
 import hashlib
 import asyncio
+import threading
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
+from flask import Flask
+from threading import Thread
 
+# ---------------- Flask для UptimeRobot ----------------
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "I'm alive!"
+
+def run_flask():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run_flask)
+    t.start()
+
+keep_alive()
+
+# ---------------- Telegram Bot ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-DB = sqlite3.connect("news.db")
+# ---------------- SQLite ----------------
+DB = sqlite3.connect("news.db", check_same_thread=False)
 CURSOR = DB.cursor()
+DB_LOCK = threading.Lock()
+
 CURSOR.execute("""
 CREATE TABLE IF NOT EXISTS news (
     hash TEXT PRIMARY KEY
@@ -27,22 +50,23 @@ CREATE TABLE IF NOT EXISTS settings (
 """)
 DB.commit()
 
-
+# ---------------- Функції для налаштувань ----------------
 def get_setting(key, default="on"):
-    CURSOR.execute("SELECT value FROM settings WHERE key=?", (key,))
-    row = CURSOR.fetchone()
-    if row:
-        return row[0]
-    CURSOR.execute("INSERT INTO settings VALUES (?,?)", (key, default))
-    DB.commit()
-    return default
-
+    with DB_LOCK:
+        CURSOR.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = CURSOR.fetchone()
+        if row:
+            return row[0]
+        CURSOR.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (key, default))
+        DB.commit()
+        return default
 
 def set_setting(key, value):
-    CURSOR.execute("REPLACE INTO settings VALUES (?,?)", (key, value))
-    DB.commit()
+    with DB_LOCK:
+        CURSOR.execute("REPLACE INTO settings VALUES (?,?)", (key, value))
+        DB.commit()
 
-
+# ---------------- RSS та аналіз ----------------
 RSS_FEEDS = [
     "https://www.pravda.com.ua/rss/",
     "https://ain.ua/feed/",
@@ -57,14 +81,12 @@ CATEGORIES = {
     "Інвертори та енергетика": ["інвертор", "резервне живлення", "акумулятор"]
 }
 
-
 def detect_category(text):
     t = text.lower()
     for cat, keys in CATEGORIES.items():
         if any(k in t for k in keys):
             return cat
     return None
-
 
 def seo_score(text):
     score = 0
@@ -78,16 +100,15 @@ def seo_score(text):
         return "СЕРЕДНІЙ"
     return "НИЗЬКИЙ"
 
-
 def is_new(text):
     h = hashlib.md5(text.encode()).hexdigest()
-    CURSOR.execute("SELECT 1 FROM news WHERE hash=?", (h,))
-    if CURSOR.fetchone():
-        return False
-    CURSOR.execute("INSERT INTO news VALUES (?)", (h,))
-    DB.commit()
-    return True
-
+    with DB_LOCK:
+        CURSOR.execute("SELECT 1 FROM news WHERE hash=?", (h,))
+        if CURSOR.fetchone():
+            return False
+        CURSOR.execute("INSERT OR IGNORE INTO news VALUES (?)", (h,))
+        DB.commit()
+        return True
 
 def analysis_block(category, seo):
     return f"""📌 Чому це важливо:
@@ -100,12 +121,11 @@ def analysis_block(category, seo):
 – аналітичний матеріал + практичні висновки
 – фокус на український контекст"""
 
-
+# ---------------- Telegram команди ----------------
 @dp.message_handler(commands=["ping"])
 async def ping(msg: types.Message):
     if msg.from_user.id == OWNER_ID:
         await msg.answer("✅ Бот працює")
-
 
 @dp.message_handler(commands=["pause"])
 async def pause(msg: types.Message):
@@ -116,11 +136,10 @@ async def pause(msg: types.Message):
     set_setting("paused", new)
     await msg.answer(f"🔕 Сповіщення: {'ВИМКНЕНО' if new=='off' else 'УВІМКНЕНО'}")
 
-
+# ---------------- Перевірка новин ----------------
 async def check_news():
     if get_setting("paused") == "off":
         return
-
     for feed_url in RSS_FEEDS:
         feed = feedparser.parse(feed_url)
         for e in feed.entries[:5]:
@@ -140,7 +159,6 @@ async def check_news():
 """
                 await bot.send_message(OWNER_ID, msg)
 
-
 async def scheduler():
     while True:
         try:
@@ -149,10 +167,12 @@ async def scheduler():
             await bot.send_message(OWNER_ID, f"⚠️ Помилка: {e}")
         await asyncio.sleep(300)
 
-
+# ---------------- Запуск ----------------
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.create_task(scheduler())
     executor.start_polling(dp, skip_updates=True)
+
+
 
 
