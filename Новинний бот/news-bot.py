@@ -151,5 +151,8 @@ async def scheduler():
 
 
 if __name__ == "__main__":
-    executor.start(dp, scheduler())
+    loop = asyncio.get_event_loop()
+    loop.create_task(scheduler())
+    executor.start_polling(dp, skip_updates=True)
+
 
